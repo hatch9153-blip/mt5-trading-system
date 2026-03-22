@@ -75,3 +75,12 @@ v1.0のEAとv2.0のEAは異なるMagic Number（v1.0: 202601, v2.0: 202602）を
 | InpAvgSellColor | OrangeRed | 平均売値ラインの色 |
 | InpPanelX | 10 | パネルのX座標 |
 | InpPanelY | 30 | パネルのY座標 |
+
+---
+
+## ファイル構成
+
+| ファイル名 | バージョン | 説明 |
+|-----------|-----------|------|
+| `LotManager.mq5` | v1.0 | 初期バージョン（平均取得価格・ポジション表示・基本GUI） |
+| `LotManagerV2.mq5` | v2.0 | 拡張バージョン（動的ゾーンUI・チャートライン指定・AutoSLオフセット変更・仮想残高・ゾーン別MaxRisk/Reward） |

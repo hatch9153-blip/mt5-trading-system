@@ -1,0 +1,877 @@
+//+------------------------------------------------------------------+
+//|                                               LotManager.mq5     |
+//|                          MT5 Lot Management & Grid Order EA       |
+//|                                         Version 2.0               |
+//+------------------------------------------------------------------+
+#property copyright "MT5 Trading System"
+#property link      "https://github.com/hatch9153-blip/mt5-trading-system"
+#property version   "2.00"
+#property description "Lot management EA v2.0: dynamic zone UI, chart-line SL/TP/High/Low, virtual balance, per-zone MaxRisk/Reward."
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+#include <Trade\OrderInfo.mqh>
+
+//--- Input Parameters
+input double InpBaseLot          = 0.1;   // Base lot size per entry
+input double InpBalancePer1000   = 0.1;   // Lot per 1000 balance
+input int    InpSLOffsetDollar   = 5;     // Default Auto-SL offset ($)
+input color  InpAvgBuyColor      = clrDodgerBlue;
+input color  InpAvgSellColor     = clrOrangeRed;
+input int    InpPanelX           = 10;
+input int    InpPanelY           = 30;
+
+//--- Global Objects
+CTrade         trade;
+CPositionInfo  posInfo;
+COrderInfo     orderInfo;
+
+//--- Panel constants
+#define PANEL_WIDTH   340
+#define MAX_ZONES     5
+#define MAGIC         202602
+
+//--- Line-pick mode enum
+enum EPickMode { PICK_NONE=0, PICK_HIGH, PICK_LOW, PICK_SL, PICK_TP };
+
+//--- Zone structure (v2.0: per-zone MaxRisk/Reward added)
+struct ZoneInfo
+{
+   double priceHigh;
+   double priceLow;
+   int    splits;
+   double sl;
+   double tp;
+   double maxRisk;    // per-zone max risk ($), 0=no limit
+   double maxReward;  // per-zone max reward ($), 0=no limit
+   bool   active;
+};
+
+//--- Global state
+ZoneInfo  g_zones[MAX_ZONES];
+int       g_zoneCount       = 1;
+double    g_globalSL        = 0.0;
+double    g_globalTP        = 0.0;
+double    g_globalMaxRisk   = 0.0;
+double    g_globalMaxReward = 0.0;
+int       g_slMode          = 0;    // 0=Global, 1=PerOrder, 2=PerZone
+bool      g_autoSL          = false;
+int       g_autoSLOffset    = 5;    // editable copy of InpSLOffsetDollar
+double    g_virtualBalance  = 0.0;  // 0 = use real balance
+string    g_symbol          = "";
+double    g_tickValue       = 0.0;
+double    g_tickSize        = 0.0;
+int       g_digits          = 0;
+
+// Chart-line pick mode
+EPickMode g_pickMode        = PICK_NONE;
+int       g_pickZone        = 0;    // which zone is being picked (0-based)
+
+// Line names for chart-based input
+string LINE_PICK = "LM_PickLine";
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                             |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   g_symbol    = Symbol();
+   g_tickValue = SymbolInfoDouble(g_symbol, SYMBOL_TRADE_TICK_VALUE);
+   g_tickSize  = SymbolInfoDouble(g_symbol, SYMBOL_TRADE_TICK_SIZE);
+   g_digits    = (int)SymbolInfoInteger(g_symbol, SYMBOL_DIGITS);
+   g_autoSLOffset = InpSLOffsetDollar;
+
+   for(int i = 0; i < MAX_ZONES; i++)
+   {
+      g_zones[i].priceHigh  = 0.0;
+      g_zones[i].priceLow   = 0.0;
+      g_zones[i].splits     = 3;
+      g_zones[i].sl         = 0.0;
+      g_zones[i].tp         = 0.0;
+      g_zones[i].maxRisk    = 0.0;
+      g_zones[i].maxReward  = 0.0;
+      g_zones[i].active     = (i == 0);
+   }
+
+   trade.SetExpertMagicNumber(MAGIC);
+   trade.SetDeviationInPoints(30);
+
+   BuildPanel();
+   UpdateAveragePriceLines();
+   UpdatePanelInfo();
+
+   ChartSetInteger(0, CHART_EVENT_MOUSE_MOVE, true);
+   EventSetTimer(1);
+
+   Print("LotManager v2.0 initialized on ", g_symbol);
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                           |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   EventKillTimer();
+   DeleteAllObjects();
+   Print("LotManager v2.0 deinitialized.");
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick                                                       |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   UpdateAveragePriceLines();
+   UpdatePanelInfo();
+}
+
+//+------------------------------------------------------------------+
+//| Timer                                                             |
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+   UpdateAveragePriceLines();
+   UpdatePanelInfo();
+}
+
+//+------------------------------------------------------------------+
+//| Chart event handler                                               |
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+{
+   //--- Button click
+   if(id == CHARTEVENT_OBJECT_CLICK)
+   {
+      HandleButtonClick(sparam);
+      return;
+   }
+
+   //--- Draggable pick-line: user moved the line → capture price
+   if(id == CHARTEVENT_OBJECT_DRAG && sparam == LINE_PICK)
+   {
+      double price = ObjectGetDouble(0, LINE_PICK, OBJPROP_PRICE, 0);
+      ApplyPickedPrice(price);
+      return;
+   }
+
+   //--- Double-click on pick-line to confirm
+   if(id == CHARTEVENT_OBJECT_DBLCLICK && sparam == LINE_PICK)
+   {
+      double price = ObjectGetDouble(0, LINE_PICK, OBJPROP_PRICE, 0);
+      ApplyPickedPrice(price);
+      EndPickMode();
+      return;
+   }
+
+   //--- ESC key: cancel pick mode
+   if(id == CHARTEVENT_KEYDOWN && lparam == 27)
+   {
+      if(g_pickMode != PICK_NONE) EndPickMode();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| === FEATURE 1 & 2: Average Price Lines & Position Info ===        |
+//+------------------------------------------------------------------+
+
+double CalcAveragePrice(ENUM_POSITION_TYPE posType, double &totalLots, int &posCount)
+{
+   double totalVolume = 0.0, weightedSum = 0.0;
+   posCount = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(posInfo.SelectByIndex(i) && posInfo.Symbol() == g_symbol && posInfo.PositionType() == posType)
+      {
+         double vol = posInfo.Volume();
+         weightedSum += posInfo.PriceOpen() * vol;
+         totalVolume += vol;
+         posCount++;
+      }
+   }
+   totalLots = totalVolume;
+   return (totalVolume > 0.0) ? weightedSum / totalVolume : 0.0;
+}
+
+void DrawAverageLine(string name, double price, color clr, string label)
+{
+   if(price <= 0.0) { ObjectDelete(0, name); ObjectDelete(0, name + "_lbl"); return; }
+   if(ObjectFind(0, name) < 0)
+   {
+      ObjectCreate(0, name, OBJ_HLINE, 0, 0, price);
+      ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+      ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_DASH);
+      ObjectSetInteger(0, name, OBJPROP_WIDTH, 2);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   }
+   else ObjectSetDouble(0, name, OBJPROP_PRICE, price);
+
+   string lblName = name + "_lbl";
+   if(ObjectFind(0, lblName) < 0) ObjectCreate(0, lblName, OBJ_TEXT, 0, TimeCurrent(), price);
+   ObjectSetDouble(0, lblName, OBJPROP_PRICE, price);
+   ObjectSetInteger(0, lblName, OBJPROP_TIME, iTime(g_symbol, PERIOD_CURRENT, 3));
+   ObjectSetString(0, lblName, OBJPROP_TEXT, label + ": " + DoubleToString(price, g_digits));
+   ObjectSetInteger(0, lblName, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, lblName, OBJPROP_FONTSIZE, 9);
+}
+
+void UpdateAveragePriceLines()
+{
+   double buyLots = 0.0, sellLots = 0.0;
+   int    buyCnt  = 0,   sellCnt  = 0;
+   double avgBuy  = CalcAveragePrice(POSITION_TYPE_BUY,  buyLots, buyCnt);
+   double avgSell = CalcAveragePrice(POSITION_TYPE_SELL, sellLots, sellCnt);
+   DrawAverageLine("LM_AvgBuy",  avgBuy,  InpAvgBuyColor,  "Avg Buy");
+   DrawAverageLine("LM_AvgSell", avgSell, InpAvgSellColor, "Avg Sell");
+}
+
+double GetEffectiveBalance()
+{
+   return (g_virtualBalance > 0.0) ? g_virtualBalance : AccountInfoDouble(ACCOUNT_BALANCE);
+}
+
+double CalcMaxAllowedLots()
+{
+   return MathFloor((GetEffectiveBalance() / 1000.0) * InpBalancePer1000 * 10.0) / 10.0;
+}
+
+double CalcCurrentLots()
+{
+   double total = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+      if(posInfo.SelectByIndex(i) && posInfo.Symbol() == g_symbol)
+         total += posInfo.Volume();
+   return total;
+}
+
+//+------------------------------------------------------------------+
+//| === FEATURE: Swing High/Low & Auto SL ===                         |
+//+------------------------------------------------------------------+
+
+double FindSwingHigh(int lookback)
+{
+   double highest = -1.0;
+   for(int i = 1; i <= lookback; i++)
+   {
+      double h = iHigh(g_symbol, PERIOD_CURRENT, i);
+      if(h > highest) highest = h;
+   }
+   return highest;
+}
+
+double FindSwingLow(int lookback)
+{
+   double lowest = DBL_MAX;
+   for(int i = 1; i <= lookback; i++)
+   {
+      double l = iLow(g_symbol, PERIOD_CURRENT, i);
+      if(l < lowest) lowest = l;
+   }
+   return lowest;
+}
+
+double DollarToPrice(double dollars, double lots = 0.0)
+{
+   double useLots = (lots > 0.0) ? lots : InpBaseLot;
+   if(g_tickValue <= 0.0 || useLots <= 0.0) return dollars * 0.01;
+   return dollars * g_tickSize / (g_tickValue * useLots);
+}
+
+double CalcAutoSL(bool isBuy, int lookback = 100)
+{
+   double offset = DollarToPrice((double)g_autoSLOffset);
+   if(isBuy)
+      return NormalizeDouble(FindSwingLow(lookback) - offset, g_digits);
+   else
+      return NormalizeDouble(FindSwingHigh(lookback) + offset, g_digits);
+}
+
+//+------------------------------------------------------------------+
+//| === FEATURE: Chart-Line Pick Mode ===                             |
+//+------------------------------------------------------------------+
+
+void StartPickMode(EPickMode mode, int zoneIdx)
+{
+   g_pickMode = mode;
+   g_pickZone = zoneIdx;
+
+   // Place a draggable horizontal line at current bid
+   double bid = SymbolInfoDouble(g_symbol, SYMBOL_BID);
+   if(ObjectFind(0, LINE_PICK) >= 0) ObjectDelete(0, LINE_PICK);
+   ObjectCreate(0, LINE_PICK, OBJ_HLINE, 0, 0, bid);
+
+   color lineColor = clrYellow;
+   string label    = "PICK";
+   if(mode == PICK_HIGH)   { lineColor = clrLime;      label = "Z" + IntegerToString(zoneIdx+1) + " HIGH → drag & dbl-click"; }
+   if(mode == PICK_LOW)    { lineColor = clrAqua;      label = "Z" + IntegerToString(zoneIdx+1) + " LOW  → drag & dbl-click"; }
+   if(mode == PICK_SL)     { lineColor = clrOrangeRed; label = "Z" + IntegerToString(zoneIdx+1) + " SL   → drag & dbl-click"; }
+   if(mode == PICK_TP)     { lineColor = clrDodgerBlue;label = "Z" + IntegerToString(zoneIdx+1) + " TP   → drag & dbl-click"; }
+
+   ObjectSetInteger(0, LINE_PICK, OBJPROP_COLOR,     lineColor);
+   ObjectSetInteger(0, LINE_PICK, OBJPROP_STYLE,     STYLE_SOLID);
+   ObjectSetInteger(0, LINE_PICK, OBJPROP_WIDTH,     2);
+   ObjectSetInteger(0, LINE_PICK, OBJPROP_SELECTABLE, true);
+   ObjectSetInteger(0, LINE_PICK, OBJPROP_SELECTED,   true);
+   ObjectSetString(0,  LINE_PICK, OBJPROP_TOOLTIP,   label);
+
+   // Update status label
+   ObjectSetString(0, "LM_PickStatus", OBJPROP_TEXT, "PICK: " + label);
+   ObjectSetInteger(0, "LM_PickStatus", OBJPROP_COLOR, lineColor);
+   ChartRedraw(0);
+}
+
+void ApplyPickedPrice(double price)
+{
+   string zs = IntegerToString(g_pickZone + 1);
+   if(g_pickMode == PICK_HIGH)
+   {
+      g_zones[g_pickZone].priceHigh = NormalizeDouble(price, g_digits);
+      ObjectSetString(0, "LM_EditZH" + zs, OBJPROP_TEXT, DoubleToString(price, g_digits));
+   }
+   else if(g_pickMode == PICK_LOW)
+   {
+      g_zones[g_pickZone].priceLow = NormalizeDouble(price, g_digits);
+      ObjectSetString(0, "LM_EditZL" + zs, OBJPROP_TEXT, DoubleToString(price, g_digits));
+   }
+   else if(g_pickMode == PICK_SL)
+   {
+      g_zones[g_pickZone].sl = NormalizeDouble(price, g_digits);
+      ObjectSetString(0, "LM_EditZSL" + zs, OBJPROP_TEXT, DoubleToString(price, g_digits));
+   }
+   else if(g_pickMode == PICK_TP)
+   {
+      g_zones[g_pickZone].tp = NormalizeDouble(price, g_digits);
+      ObjectSetString(0, "LM_EditZTP" + zs, OBJPROP_TEXT, DoubleToString(price, g_digits));
+   }
+   ChartRedraw(0);
+}
+
+void EndPickMode()
+{
+   g_pickMode = PICK_NONE;
+   ObjectDelete(0, LINE_PICK);
+   ObjectSetString(0, "LM_PickStatus", OBJPROP_TEXT, "");
+   ChartRedraw(0);
+}
+
+//+------------------------------------------------------------------+
+//| === FEATURE: Grid Order Placement ===                             |
+//+------------------------------------------------------------------+
+
+void CalcExpectedPL(double &totalRisk, double &totalReward)
+{
+   totalRisk = 0.0; totalReward = 0.0;
+
+   for(int z = 0; z < g_zoneCount; z++)
+   {
+      if(!g_zones[z].active) continue;
+      if(g_zones[z].priceHigh <= 0.0 || g_zones[z].priceLow <= 0.0) continue;
+      if(g_zones[z].splits <= 0) continue;
+
+      double range = MathAbs(g_zones[z].priceHigh - g_zones[z].priceLow);
+      double step  = (g_zones[z].splits > 1) ? range / (g_zones[z].splits - 1) : 0;
+      double sl    = (g_slMode == 2) ? g_zones[z].sl : g_globalSL;
+      double tp    = (g_slMode == 2) ? g_zones[z].tp : g_globalTP;
+
+      double zoneRisk = 0.0, zoneReward = 0.0;
+
+      for(int s = 0; s < g_zones[z].splits; s++)
+      {
+         double entryPrice = g_zones[z].priceHigh - step * s;
+         if(sl > 0.0) zoneRisk   += MathAbs(entryPrice - sl) / g_tickSize * g_tickValue * InpBaseLot;
+         if(tp > 0.0) zoneReward += MathAbs(tp - entryPrice)  / g_tickSize * g_tickValue * InpBaseLot;
+      }
+
+      // Apply per-zone MaxRisk/Reward caps
+      if(g_zones[z].maxRisk   > 0.0) zoneRisk   = MathMin(zoneRisk,   g_zones[z].maxRisk);
+      if(g_zones[z].maxReward > 0.0) zoneReward = MathMin(zoneReward, g_zones[z].maxReward);
+
+      totalRisk   += zoneRisk;
+      totalReward += zoneReward;
+   }
+
+   // Apply global MaxRisk/Reward caps
+   if(g_globalMaxRisk   > 0.0) totalRisk   = MathMin(totalRisk,   g_globalMaxRisk);
+   if(g_globalMaxReward > 0.0) totalReward = MathMin(totalReward, g_globalMaxReward);
+}
+
+void PlaceGridOrders()
+{
+   ReadPanelFields();
+   int totalPlaced = 0;
+
+   for(int z = 0; z < g_zoneCount; z++)
+   {
+      if(!g_zones[z].active) continue;
+      if(g_zones[z].priceHigh <= 0.0 || g_zones[z].priceLow <= 0.0) { Print("Zone ", z+1, ": price range not set."); continue; }
+      if(g_zones[z].splits <= 0) continue;
+
+      double high  = g_zones[z].priceHigh;
+      double low   = g_zones[z].priceLow;
+      bool   isBuy = (high >= low);
+      double range = MathAbs(high - low);
+      double step  = (g_zones[z].splits > 1) ? range / (g_zones[z].splits - 1) : 0;
+
+      double sl = (g_slMode == 2) ? g_zones[z].sl : g_globalSL;
+      double tp = (g_slMode == 2) ? g_zones[z].tp : g_globalTP;
+      if(g_autoSL && sl == 0.0) sl = CalcAutoSL(isBuy);
+
+      for(int s = 0; s < g_zones[z].splits; s++)
+      {
+         double price  = NormalizeDouble(high - step * s, g_digits);
+         double slNorm = NormalizeDouble(sl, g_digits);
+         double tpNorm = NormalizeDouble(tp, g_digits);
+         bool   result = false;
+
+         if(isBuy)
+         {
+            double ask = SymbolInfoDouble(g_symbol, SYMBOL_ASK);
+            result = (price < ask)
+               ? trade.BuyLimit(InpBaseLot, price, g_symbol, slNorm, tpNorm, ORDER_TIME_GTC, 0, "LMv2_Z" + IntegerToString(z+1))
+               : trade.BuyStop(InpBaseLot,  price, g_symbol, slNorm, tpNorm, ORDER_TIME_GTC, 0, "LMv2_Z" + IntegerToString(z+1));
+         }
+         else
+         {
+            double bid = SymbolInfoDouble(g_symbol, SYMBOL_BID);
+            result = (price > bid)
+               ? trade.SellLimit(InpBaseLot, price, g_symbol, slNorm, tpNorm, ORDER_TIME_GTC, 0, "LMv2_Z" + IntegerToString(z+1))
+               : trade.SellStop(InpBaseLot,  price, g_symbol, slNorm, tpNorm, ORDER_TIME_GTC, 0, "LMv2_Z" + IntegerToString(z+1));
+         }
+
+         if(result) totalPlaced++;
+         else Print("Order failed at ", price, " | Error: ", GetLastError());
+      }
+   }
+   Print("LotManager v2.0: Placed ", totalPlaced, " orders.");
+   UpdatePanelInfo();
+}
+
+void CancelAllGridOrders()
+{
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+      if(orderInfo.SelectByIndex(i) && orderInfo.Symbol() == g_symbol && orderInfo.Magic() == MAGIC)
+         trade.OrderDelete(orderInfo.Ticket());
+   Print("LotManager v2.0: All grid orders cancelled.");
+}
+
+//+------------------------------------------------------------------+
+//| === GUI PANEL CONSTRUCTION ===                                    |
+//+------------------------------------------------------------------+
+
+void DeleteAllObjects() { ObjectsDeleteAll(0, "LM_"); }
+
+void CreateRect(string name, int x, int y, int w, int h, color bgColor, int corner = CORNER_LEFT_UPPER)
+{
+   if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
+   ObjectCreate(0, name, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE,   x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE,   y);
+   ObjectSetInteger(0, name, OBJPROP_XSIZE,       w);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE,       h);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR,     bgColor);
+   ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,       clrGray);
+   ObjectSetInteger(0, name, OBJPROP_CORNER,      corner);
+   ObjectSetInteger(0, name, OBJPROP_BACK,        false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE,  false);
+}
+
+void CreateLabel(string name, int x, int y, string text, color clr, int fontSize = 9, int corner = CORNER_LEFT_UPPER)
+{
+   if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
+   ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE,  x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE,  y);
+   ObjectSetString(0,  name, OBJPROP_TEXT,       text);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,      clr);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE,   fontSize);
+   ObjectSetInteger(0, name, OBJPROP_CORNER,     corner);
+   ObjectSetInteger(0, name, OBJPROP_BACK,       false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+}
+
+void CreateButton(string name, int x, int y, int w, int h, string text, color bgColor, color textColor = clrWhite, int corner = CORNER_LEFT_UPPER)
+{
+   if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
+   ObjectCreate(0, name, OBJ_BUTTON, 0, 0, 0);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE,  x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE,  y);
+   ObjectSetInteger(0, name, OBJPROP_XSIZE,      w);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE,      h);
+   ObjectSetString(0,  name, OBJPROP_TEXT,       text);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR,    bgColor);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,      textColor);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE,   9);
+   ObjectSetInteger(0, name, OBJPROP_CORNER,     corner);
+   ObjectSetInteger(0, name, OBJPROP_BACK,       false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+}
+
+void CreateEdit(string name, int x, int y, int w, int h, string text, int corner = CORNER_LEFT_UPPER)
+{
+   if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
+   ObjectCreate(0, name, OBJ_EDIT, 0, 0, 0);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE,  x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE,  y);
+   ObjectSetInteger(0, name, OBJPROP_XSIZE,      w);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE,      h);
+   ObjectSetString(0,  name, OBJPROP_TEXT,       text);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR,    clrWhiteSmoke);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,      clrBlack);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE,   9);
+   ObjectSetInteger(0, name, OBJPROP_CORNER,     corner);
+   ObjectSetInteger(0, name, OBJPROP_BACK,       false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_READONLY,   false);
+}
+
+//--- Estimate panel height based on current zone count
+int CalcPanelHeight()
+{
+   // Base: header + account section + zone-count row + active zones + SL/TP + P/L + buttons
+   int base = 5 + 22 + 20 + 7*20 + 5;   // title + account info (7 rows)
+   base += 20 + 20 + 5;                  // zone count row
+   base += g_zoneCount * (20 + 20 + 4);  // each zone: 2 rows (High/Low + Splits/TP/SL) + pick buttons row
+   base += 20 + 20 + 20 + 20 + 5;       // Global SL/TP section
+   base += 20 + 20 + 20 + 5;            // AutoSL + VirtualBalance + MaxRisk/Reward
+   base += 20 + 20 + 5;                  // Expected P/L
+   base += 28 + 28 + 10;                 // Action buttons
+   return base;
+}
+
+//+------------------------------------------------------------------+
+//| Build the full panel                                              |
+//+------------------------------------------------------------------+
+void BuildPanel()
+{
+   int x  = InpPanelX;
+   int y  = InpPanelY;
+   int w  = PANEL_WIDTH;
+   int lh = 20;
+   int py = y;
+
+   int panelH = CalcPanelHeight();
+   CreateRect("LM_BG", x, py, w, panelH, C'30,30,40');
+   py += 5;
+
+   // Title
+   CreateLabel("LM_Title", x+10, py, "=== LotManager v2.0 ===", clrGold, 10);
+   py += 22;
+
+   // --- Account & Position Info ---
+   CreateLabel("LM_SecInfo", x+10, py, "-- Account & Position Info --", clrSilver, 9);
+   py += lh;
+
+   // Virtual Balance row
+   CreateLabel("LM_LblVBal",  x+10, py, "VirtBal($):", clrWhite, 9);
+   CreateEdit("LM_EditVBal",  x+90, py, 80, 16,
+              (g_virtualBalance > 0 ? DoubleToString(g_virtualBalance, 2) : "0"));
+   CreateLabel("LM_LblVBalHint", x+175, py, "(0=real)", clrGray, 8);
+   py += lh;
+
+   CreateLabel("LM_LblBalance",  x+10, py, "Balance:",      clrWhite, 9);
+   CreateLabel("LM_ValBalance",  x+90, py, "---",           clrYellow, 9);
+   py += lh;
+   CreateLabel("LM_LblMaxLot",   x+10, py, "Max Lots:",     clrWhite, 9);
+   CreateLabel("LM_ValMaxLot",   x+90, py, "---",           clrYellow, 9);
+   py += lh;
+   CreateLabel("LM_LblCurLot",   x+10, py, "Current Lots:", clrWhite, 9);
+   CreateLabel("LM_ValCurLot",   x+90, py, "---",           clrCyan, 9);
+   py += lh;
+   CreateLabel("LM_LblAddLot",   x+10, py, "Addable:",      clrWhite, 9);
+   CreateLabel("LM_ValAddLot",   x+90, py, "---",           clrLimeGreen, 9);
+   py += lh;
+   CreateLabel("LM_LblPosCnt",   x+10, py, "Positions:",    clrWhite, 9);
+   CreateLabel("LM_ValPosCnt",   x+90, py, "Buy:0 Sell:0",  clrCyan, 9);
+   py += lh;
+   CreateLabel("LM_LblAvgBuy",   x+10, py, "Avg Buy:",      clrDodgerBlue, 9);
+   CreateLabel("LM_ValAvgBuy",   x+90, py, "---",           clrDodgerBlue, 9);
+   py += lh;
+   CreateLabel("LM_LblAvgSell",  x+10, py, "Avg Sell:",     clrOrangeRed, 9);
+   CreateLabel("LM_ValAvgSell",  x+90, py, "---",           clrOrangeRed, 9);
+   py += lh + 5;
+
+   // --- Zone Count Selection ---
+   CreateLabel("LM_SecZone", x+10, py, "-- Active Zones --", clrSilver, 9);
+   py += lh;
+   CreateLabel("LM_LblZoneCnt", x+10, py, "Zones:", clrWhite, 9);
+   for(int i = 1; i <= MAX_ZONES; i++)
+   {
+      color bc = (i == g_zoneCount) ? clrGold : C'50,50,70';
+      CreateButton("LM_BtnZ" + IntegerToString(i), x+55+(i-1)*26, py, 24, 18, IntegerToString(i), bc, clrWhite);
+   }
+   py += lh + 5;
+
+   // --- Zone Input Rows (only active zones shown) ---
+   for(int z = 0; z < g_zoneCount; z++)
+   {
+      string zs  = IntegerToString(z+1);
+      color  hdr = clrGold;
+
+      // Zone header
+      CreateLabel("LM_LblZHdr" + zs, x+10, py, "[ Zone " + zs + " ]", hdr, 9);
+      py += lh;
+
+      // High / Low row
+      CreateLabel("LM_LblZH" + zs,  x+10,  py, "High:", clrWhite, 9);
+      CreateEdit("LM_EditZH" + zs,   x+45,  py, 68, 16,
+                 (g_zones[z].priceHigh > 0 ? DoubleToString(g_zones[z].priceHigh, g_digits) : "0.00"));
+      CreateButton("LM_BtnPickH" + zs, x+116, py, 18, 16, "L", C'0,80,0', clrWhite);  // pick High line
+
+      CreateLabel("LM_LblZL" + zs,  x+138, py, "Low:", clrWhite, 9);
+      CreateEdit("LM_EditZL" + zs,   x+165, py, 68, 16,
+                 (g_zones[z].priceLow > 0 ? DoubleToString(g_zones[z].priceLow, g_digits) : "0.00"));
+      CreateButton("LM_BtnPickL" + zs, x+236, py, 18, 16, "L", C'0,60,80', clrWhite);  // pick Low line
+      py += lh;
+
+      // Splits / TP / SL row
+      CreateLabel("LM_LblZS" + zs,  x+10,  py, "Splits:", clrWhite, 9);
+      CreateEdit("LM_EditZS" + zs,   x+55,  py, 30, 16, IntegerToString(g_zones[z].splits));
+
+      CreateLabel("LM_LblZTP" + zs, x+92,  py, "TP:", clrWhite, 9);
+      CreateEdit("LM_EditZTP" + zs,  x+110, py, 60, 16,
+                 (g_zones[z].tp > 0 ? DoubleToString(g_zones[z].tp, g_digits) : "0.00"));
+      CreateButton("LM_BtnPickTP" + zs, x+173, py, 18, 16, "L", C'0,60,140', clrWhite);
+
+      CreateLabel("LM_LblZSL" + zs, x+195, py, "SL:", clrWhite, 9);
+      CreateEdit("LM_EditZSL" + zs,  x+213, py, 60, 16,
+                 (g_zones[z].sl > 0 ? DoubleToString(g_zones[z].sl, g_digits) : "0.00"));
+      CreateButton("LM_BtnPickSL" + zs, x+276, py, 18, 16, "L", C'140,40,0', clrWhite);
+      py += lh;
+
+      // MaxRisk / MaxReward row
+      CreateLabel("LM_LblZMR" + zs,  x+10,  py, "MaxRisk($):", clrWhite, 9);
+      CreateEdit("LM_EditZMR" + zs,   x+80,  py, 50, 16,
+                 (g_zones[z].maxRisk > 0 ? DoubleToString(g_zones[z].maxRisk, 2) : "0"));
+      CreateLabel("LM_LblZMRw" + zs, x+135, py, "MaxRwd($):", clrWhite, 9);
+      CreateEdit("LM_EditZMRw" + zs,  x+205, py, 50, 16,
+                 (g_zones[z].maxReward > 0 ? DoubleToString(g_zones[z].maxReward, 2) : "0"));
+      py += lh + 4;
+   }
+
+   // --- Global SL/TP ---
+   CreateLabel("LM_SecSLTP", x+10, py, "-- Global SL/TP --", clrSilver, 9);
+   py += lh;
+   CreateLabel("LM_LblGSL",  x+10,  py, "Global SL:", clrWhite, 9);
+   CreateEdit("LM_EditGSL",  x+80,  py, 70, 16, "0.00");
+   CreateLabel("LM_LblGTP",  x+160, py, "Global TP:", clrWhite, 9);
+   CreateEdit("LM_EditGTP",  x+230, py, 70, 16, "0.00");
+   py += lh;
+
+   // SL Mode
+   CreateLabel("LM_LblSLMode", x+10, py, "SL Mode:", clrWhite, 9);
+   CreateButton("LM_BtnSLM0", x+75,  py, 65, 18, "Global",   (g_slMode==0?clrGold:C'50,50,70'), clrWhite);
+   CreateButton("LM_BtnSLM1", x+143, py, 65, 18, "PerOrder", (g_slMode==1?clrGold:C'50,50,70'), clrWhite);
+   CreateButton("LM_BtnSLM2", x+211, py, 65, 18, "PerZone",  (g_slMode==2?clrGold:C'50,50,70'), clrWhite);
+   py += lh;
+
+   // Auto SL + editable offset
+   CreateButton("LM_BtnAutoSL", x+10, py, 130, 18,
+                (g_autoSL ? "[ON] AutoSL(Swing)" : "[OFF] AutoSL(Swing)"),
+                (g_autoSL ? clrDarkGreen : C'50,50,70'), clrWhite);
+   CreateLabel("LM_LblASLOff", x+145, py, "Offset($):", clrWhite, 9);
+   CreateEdit("LM_EditASLOff", x+215, py, 50, 16, IntegerToString(g_autoSLOffset));
+   py += lh;
+
+   // Global MaxRisk / MaxReward
+   CreateLabel("LM_LblGMR",  x+10,  py, "MaxRisk($):", clrWhite, 9);
+   CreateEdit("LM_EditGMR",  x+80,  py, 60, 16,
+              (g_globalMaxRisk > 0 ? DoubleToString(g_globalMaxRisk, 2) : "0"));
+   CreateLabel("LM_LblGMRw", x+148, py, "MaxRwd($):", clrWhite, 9);
+   CreateEdit("LM_EditGMRw", x+218, py, 60, 16,
+              (g_globalMaxReward > 0 ? DoubleToString(g_globalMaxReward, 2) : "0"));
+   py += lh + 5;
+
+   // --- Expected P/L ---
+   CreateLabel("LM_SecPL",     x+10,  py, "-- Expected P/L --", clrSilver, 9);
+   py += lh;
+   CreateLabel("LM_LblRisk",   x+10,  py, "Max Risk ($):",   clrWhite, 9);
+   CreateLabel("LM_ValRisk",   x+110, py, "---",             clrOrangeRed, 9);
+   py += lh;
+   CreateLabel("LM_LblReward", x+10,  py, "Max Reward ($):", clrWhite, 9);
+   CreateLabel("LM_ValReward", x+110, py, "---",             clrLimeGreen, 9);
+   py += lh + 5;
+
+   // --- Action Buttons ---
+   CreateButton("LM_BtnCalc",   x+10,  py, 90, 22, "Calc P/L",     C'0,80,120',  clrWhite);
+   CreateButton("LM_BtnPlace",  x+110, py, 90, 22, "Place Orders", C'0,120,0',   clrWhite);
+   CreateButton("LM_BtnCancel", x+210, py, 90, 22, "Cancel All",   C'140,0,0',   clrWhite);
+   py += 28;
+   CreateButton("LM_BtnRefresh", x+10, py, 90, 22, "Refresh",      C'60,60,80',  clrWhite);
+   CreateButton("LM_BtnRead",   x+110, py, 90, 22, "Read Fields",  C'80,60,20',  clrWhite);
+   py += 28;
+
+   // Pick status label (shown when pick mode is active)
+   CreateLabel("LM_PickStatus", x+10, py, "", clrYellow, 9);
+
+   ChartRedraw(0);
+}
+
+//--- Read all edit field values into g_zones and globals
+void ReadPanelFields()
+{
+   // Virtual balance
+   double vb = StringToDouble(ObjectGetString(0, "LM_EditVBal", OBJPROP_TEXT));
+   g_virtualBalance = (vb > 0.0) ? vb : 0.0;
+
+   // AutoSL offset
+   int aslOff = (int)StringToInteger(ObjectGetString(0, "LM_EditASLOff", OBJPROP_TEXT));
+   if(aslOff > 0) g_autoSLOffset = aslOff;
+
+   // Global SL/TP and MaxRisk/Reward
+   g_globalSL        = StringToDouble(ObjectGetString(0, "LM_EditGSL",  OBJPROP_TEXT));
+   g_globalTP        = StringToDouble(ObjectGetString(0, "LM_EditGTP",  OBJPROP_TEXT));
+   g_globalMaxRisk   = StringToDouble(ObjectGetString(0, "LM_EditGMR",  OBJPROP_TEXT));
+   g_globalMaxReward = StringToDouble(ObjectGetString(0, "LM_EditGMRw", OBJPROP_TEXT));
+
+   // Per-zone fields
+   for(int z = 0; z < MAX_ZONES; z++)
+   {
+      string zs = IntegerToString(z+1);
+      if(z < g_zoneCount)
+      {
+         g_zones[z].priceHigh = StringToDouble(ObjectGetString(0, "LM_EditZH"   + zs, OBJPROP_TEXT));
+         g_zones[z].priceLow  = StringToDouble(ObjectGetString(0, "LM_EditZL"   + zs, OBJPROP_TEXT));
+         g_zones[z].splits    = (int)StringToInteger(ObjectGetString(0, "LM_EditZS" + zs, OBJPROP_TEXT));
+         g_zones[z].tp        = StringToDouble(ObjectGetString(0, "LM_EditZTP"  + zs, OBJPROP_TEXT));
+         g_zones[z].sl        = StringToDouble(ObjectGetString(0, "LM_EditZSL"  + zs, OBJPROP_TEXT));
+         g_zones[z].maxRisk   = StringToDouble(ObjectGetString(0, "LM_EditZMR"  + zs, OBJPROP_TEXT));
+         g_zones[z].maxReward = StringToDouble(ObjectGetString(0, "LM_EditZMRw" + zs, OBJPROP_TEXT));
+      }
+      g_zones[z].active = (z < g_zoneCount);
+   }
+}
+
+//--- Update dynamic labels
+void UpdatePanelInfo()
+{
+   double balance  = GetEffectiveBalance();
+   double maxLots  = CalcMaxAllowedLots();
+   double curLots  = CalcCurrentLots();
+   double addLots  = MathMax(0.0, maxLots - curLots);
+   int    addPosns = (InpBaseLot > 0) ? (int)MathFloor(addLots / InpBaseLot) : 0;
+
+   double buyLots = 0.0, sellLots = 0.0;
+   int    buyCnt  = 0,   sellCnt  = 0;
+   double avgBuy  = CalcAveragePrice(POSITION_TYPE_BUY,  buyLots, buyCnt);
+   double avgSell = CalcAveragePrice(POSITION_TYPE_SELL, sellLots, sellCnt);
+
+   string balLabel = DoubleToString(balance, 2);
+   if(g_virtualBalance > 0.0) balLabel += " [VIRT]";
+
+   ObjectSetString(0, "LM_ValBalance", OBJPROP_TEXT, balLabel);
+   ObjectSetString(0, "LM_ValMaxLot",  OBJPROP_TEXT, DoubleToString(maxLots, 2) + " lots");
+   ObjectSetString(0, "LM_ValCurLot",  OBJPROP_TEXT, DoubleToString(curLots, 2) + " lots");
+   ObjectSetString(0, "LM_ValAddLot",  OBJPROP_TEXT, DoubleToString(addLots, 2) + " lots (" + IntegerToString(addPosns) + " pos)");
+   ObjectSetString(0, "LM_ValPosCnt",  OBJPROP_TEXT, "Buy:" + IntegerToString(buyCnt) + " Sell:" + IntegerToString(sellCnt));
+   ObjectSetString(0, "LM_ValAvgBuy",  OBJPROP_TEXT, (avgBuy  > 0 ? DoubleToString(avgBuy,  g_digits) : "---"));
+   ObjectSetString(0, "LM_ValAvgSell", OBJPROP_TEXT, (avgSell > 0 ? DoubleToString(avgSell, g_digits) : "---"));
+
+   ChartRedraw(0);
+}
+
+void UpdateExpectedPL()
+{
+   ReadPanelFields();
+   double risk = 0.0, reward = 0.0;
+   CalcExpectedPL(risk, reward);
+   ObjectSetString(0, "LM_ValRisk",   OBJPROP_TEXT, DoubleToString(risk,   2));
+   ObjectSetString(0, "LM_ValReward", OBJPROP_TEXT, DoubleToString(reward, 2));
+   ChartRedraw(0);
+}
+
+void RefreshZoneButtons()
+{
+   for(int i = 1; i <= MAX_ZONES; i++)
+      ObjectSetInteger(0, "LM_BtnZ" + IntegerToString(i), OBJPROP_BGCOLOR,
+                       (i == g_zoneCount ? clrGold : C'50,50,70'));
+   ChartRedraw(0);
+}
+
+void RefreshSLModeButtons()
+{
+   ObjectSetInteger(0, "LM_BtnSLM0", OBJPROP_BGCOLOR, (g_slMode==0 ? clrGold : C'50,50,70'));
+   ObjectSetInteger(0, "LM_BtnSLM1", OBJPROP_BGCOLOR, (g_slMode==1 ? clrGold : C'50,50,70'));
+   ObjectSetInteger(0, "LM_BtnSLM2", OBJPROP_BGCOLOR, (g_slMode==2 ? clrGold : C'50,50,70'));
+   ChartRedraw(0);
+}
+
+//+------------------------------------------------------------------+
+//| Button click handler                                              |
+//+------------------------------------------------------------------+
+void HandleButtonClick(string name)
+{
+   // Zone count buttons → rebuild panel to show/hide zone rows
+   for(int i = 1; i <= MAX_ZONES; i++)
+   {
+      if(name == "LM_BtnZ" + IntegerToString(i))
+      {
+         ReadPanelFields();  // save current values before rebuild
+         g_zoneCount = i;
+         for(int z = 0; z < MAX_ZONES; z++) g_zones[z].active = (z < g_zoneCount);
+         DeleteAllObjects();
+         BuildPanel();
+         UpdatePanelInfo();
+         ObjectSetInteger(0, name, OBJPROP_STATE, false);
+         return;
+      }
+   }
+
+   // Chart-line pick buttons for each zone
+   for(int z = 0; z < MAX_ZONES; z++)
+   {
+      string zs = IntegerToString(z+1);
+      if(name == "LM_BtnPickH"  + zs) { StartPickMode(PICK_HIGH, z); ObjectSetInteger(0, name, OBJPROP_STATE, false); return; }
+      if(name == "LM_BtnPickL"  + zs) { StartPickMode(PICK_LOW,  z); ObjectSetInteger(0, name, OBJPROP_STATE, false); return; }
+      if(name == "LM_BtnPickSL" + zs) { StartPickMode(PICK_SL,   z); ObjectSetInteger(0, name, OBJPROP_STATE, false); return; }
+      if(name == "LM_BtnPickTP" + zs) { StartPickMode(PICK_TP,   z); ObjectSetInteger(0, name, OBJPROP_STATE, false); return; }
+   }
+
+   // SL mode
+   if(name == "LM_BtnSLM0") { g_slMode = 0; RefreshSLModeButtons(); ObjectSetInteger(0, name, OBJPROP_STATE, false); return; }
+   if(name == "LM_BtnSLM1") { g_slMode = 1; RefreshSLModeButtons(); ObjectSetInteger(0, name, OBJPROP_STATE, false); return; }
+   if(name == "LM_BtnSLM2") { g_slMode = 2; RefreshSLModeButtons(); ObjectSetInteger(0, name, OBJPROP_STATE, false); return; }
+
+   // Auto SL toggle
+   if(name == "LM_BtnAutoSL")
+   {
+      g_autoSL = !g_autoSL;
+      ObjectSetString(0, "LM_BtnAutoSL", OBJPROP_TEXT,
+                      (g_autoSL ? "[ON] AutoSL(Swing)" : "[OFF] AutoSL(Swing)"));
+      ObjectSetInteger(0, "LM_BtnAutoSL", OBJPROP_BGCOLOR,
+                       (g_autoSL ? clrDarkGreen : C'50,50,70'));
+      ObjectSetInteger(0, name, OBJPROP_STATE, false);
+      ChartRedraw(0);
+      return;
+   }
+
+   // Calc P/L
+   if(name == "LM_BtnCalc")   { UpdateExpectedPL(); ObjectSetInteger(0, name, OBJPROP_STATE, false); return; }
+
+   // Place orders
+   if(name == "LM_BtnPlace")  { PlaceGridOrders(); ObjectSetInteger(0, name, OBJPROP_STATE, false); return; }
+
+   // Cancel all
+   if(name == "LM_BtnCancel") { CancelAllGridOrders(); ObjectSetInteger(0, name, OBJPROP_STATE, false); return; }
+
+   // Refresh
+   if(name == "LM_BtnRefresh")
+   {
+      DeleteAllObjects();
+      BuildPanel();
+      UpdateAveragePriceLines();
+      UpdatePanelInfo();
+      ObjectSetInteger(0, name, OBJPROP_STATE, false);
+      return;
+   }
+
+   // Read fields
+   if(name == "LM_BtnRead")
+   {
+      ReadPanelFields();
+      UpdateExpectedPL();
+      ObjectSetInteger(0, name, OBJPROP_STATE, false);
+      return;
+   }
+}
+//+------------------------------------------------------------------+
