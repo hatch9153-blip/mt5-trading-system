@@ -70,16 +70,30 @@ Backtest/
 
 ---
 
+## データの配置（ZIP / 環境変数）
+
+1分足 CSV（`date,time,open,high,low,close,volume` 形式）を **再帰的に** 読み込みます。
+
+- **既定パス**: `Backtest/stoch_logic2/csv_data/`（`GOLD_XEM_mcr_20xx_all.zip` を解凍し、中の `.csv` をこのフォルダ以下に置く）
+- **上書き**: 環境変数 `STOCH_CSV_DIR` にルートフォルダを指定
+- **出力**: 既定は `Backtest/stoch_logic2/output/`。`STOCH_OUTPUT_DIR` で変更可
+
+`backtest_logic2.py` は初期残高 **10万円** でロット **A=0.01 / B=0.1 / C=0.05** の比較を実行し、`output/compare_ABC_summary.md`（および `.csv`）、各シナリオの月次 `monthly_*.md` / `.csv` を生成します。
+
+---
+
 ## 実行方法
 
 ```bash
+cd Backtest/stoch_logic2
+
 # 依存パッケージ
 pip install pandas numpy matplotlib
 
-# バックテスト実行（CSVデータが csv_data/ に必要）
+# バックテスト（csv_data に CSV が必要）
 python backtest_logic2.py
 
-# レポート生成
+# レポート生成（別スクリプト）
 python report_logic2.py
 ```
 
