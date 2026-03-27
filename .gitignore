@@ -1,3 +1,9 @@
 __pycache__/
 *.py[cod]
 *$py.class
+
+# XM から解凍した 1 分足 CSV（容量大）
+Backtest/stoch_logic2/csv_data/xm_mcr/**/*.csv
+
+# バックテスト結果バイナリ（再生成可）
+Backtest/stoch_logic2/output/*.pkl

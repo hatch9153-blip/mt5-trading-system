@@ -7,7 +7,7 @@ Stochastics EA バックテストエンジン ロジック②
 GOLD の 1分足 CSV を再帰配置（ZIP 解凍先をここに合わせる）。
 出力: 環境変数 STOCH_OUTPUT_DIR または 本スクリプト直下の output/
 
-シナリオ A/B/C: メインで初期残高 10万円・ロット A=0.01, B=0.10, C=0.05 を比較。
+シナリオ: 初期残高 10万円でロット A=0.01, B=0.10, C=0.05, D=0.50, E=1.00 を比較。
 """
 
 import pandas as pd
@@ -17,18 +17,30 @@ import os
 import pickle
 import csv
 import warnings
+import sys
 warnings.filterwarnings('ignore')
+
+# Windows コンソール (cp932) で円記号などを print するため
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 # ===== パス（環境変数で上書き可）=====
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_DIR = os.environ.get('STOCH_CSV_DIR', os.path.join(_SCRIPT_DIR, 'csv_data'))
 OUTPUT_DIR = os.environ.get('STOCH_OUTPUT_DIR', os.path.join(_SCRIPT_DIR, 'output'))
 
-# A: 10万・0.01 / B: 10万・0.1 / C: 10万・0.05（グリッドの代表）
+# 10万円スタート・ロット別
 SCENARIOS = [
     ('A_100k_0.01', 100_000, 0.01),
     ('B_100k_0.10', 100_000, 0.10),
     ('C_100k_0.05', 100_000, 0.05),
+    ('D_100k_0.50', 100_000, 0.50),
+    ('E_100k_1.00', 100_000, 1.00),
 ]
 
 USD_JPY       = 150.0
@@ -45,6 +57,9 @@ OVERBOUGHT = 80.0
 DAILY_PROFIT_TARGET_PCT = 0.20
 MAX_DAILY_LOSS_PCT      = 0.10
 MAX_CONSECUTIVE_LOSSES  = 5
+
+# 日次 +20% 達成で当日トレード停止（⑥）。False で同条件のみこの制限を外す。
+USE_DAILY_PROFIT_STOP = True
 
 
 def calc_stoch(df, k_period=9, slowing=3, d_period=3):
@@ -91,17 +106,35 @@ def resample(df1m, rule):
     return df
 
 
-def run_backtest(df1m, initial_balance, lot_size):
-    print(f"\n{'='*65}")
-    print(f"バックテスト [ロジック②]: 初期資金 ¥{initial_balance:,} ロット {lot_size}")
-    print(f"{'='*65}")
+def run_backtest(
+    df1m,
+    initial_balance,
+    lot_size,
+    use_daily_profit_stop=None,
+    verbose=True,
+):
+    """
+    use_daily_profit_stop: None のときはグローバル USE_DAILY_PROFIT_STOP を使用。
+    False のときは「当日 +20%」による day_blocked を付けない（連敗・-10% は従来通り）。
+    """
+    if use_daily_profit_stop is None:
+        use_daily_profit_stop = USE_DAILY_PROFIT_STOP
 
-    print("リサンプリング中...")
+    if verbose:
+        print(f"\n{'='*65}")
+        print(
+            f"バックテスト [ロジック②]: 初期資金 ¥{initial_balance:,} ロット {lot_size} "
+            f"日次+20%停止={'ON' if use_daily_profit_stop else 'OFF'}"
+        )
+        print(f"{'='*65}")
+
+        print("リサンプリング中...")
     df5m = resample(df1m, '5min')
     df1h = resample(df1m, '1h')
     df4h = resample(df1m, '4h')
 
-    print("Stochastics計算中...")
+    if verbose:
+        print("Stochastics計算中...")
     k5m, d5m = calc_stoch(df5m)
     k1h, d1h = calc_stoch(df1h)
     k4h, d4h = calc_stoch(df4h)
@@ -123,7 +156,8 @@ def run_backtest(df1m, initial_balance, lot_size):
     df5m = pd.merge_asof(df5m.sort_values('dt'), df4h_s.sort_values('dt'),
                          on='dt', direction='backward')
     df5m = df5m.reset_index(drop=True)
-    print(f"  マージ完了: {len(df5m):,}行（5M足）")
+    if verbose:
+        print(f"  マージ完了: {len(df5m):,}行（5M足）")
 
     balance = float(initial_balance)
     trades = []
@@ -143,7 +177,8 @@ def run_backtest(df1m, initial_balance, lot_size):
     day_blocked = False
 
     n = len(df5m)
-    print("シミュレーション実行中...")
+    if verbose:
+        print("シミュレーション実行中...")
 
     for i in range(50, n):
         row = df5m.iloc[i]
@@ -236,7 +271,7 @@ def run_backtest(df1m, initial_balance, lot_size):
 
                 if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
                     day_blocked = True
-                if balance >= day_start_balance * (1 + DAILY_PROFIT_TARGET_PCT):
+                if use_daily_profit_stop and balance >= day_start_balance * (1 + DAILY_PROFIT_TARGET_PCT):
                     day_blocked = True
                 if balance <= day_start_balance * (1 - MAX_DAILY_LOSS_PCT):
                     day_blocked = True
@@ -289,7 +324,7 @@ def run_backtest(df1m, initial_balance, lot_size):
                 entry_time = dt
                 position_side = 'short'
 
-        if i % 50000 == 0 and i > 0:
+        if verbose and i % 50000 == 0 and i > 0:
             print(f"  進捗: {i/n*100:.1f}% | トレード数: {len(trades)} | 残高: ¥{balance:,.0f}")
 
     if in_position:
@@ -311,8 +346,61 @@ def run_backtest(df1m, initial_balance, lot_size):
         })
 
     trades_df = pd.DataFrame(trades)
-    print(f"\n  完了: {len(trades_df)}トレード | 最終残高: ¥{balance:,.0f}")
+    if verbose:
+        print(f"\n  完了: {len(trades_df)}トレード | 最終残高: ¥{balance:,.0f}")
     return trades_df, balance
+
+
+def compare_daily_profit_stop(df1m, initial_balance=10_000, lot_size=0.01):
+    """
+    report_logic2.md と同じ ¥10,000 / 0.01 ロットで、
+    ⑥ 日次+20% 停止の ON / OFF を比較する。
+    """
+    print("\n" + "=" * 65)
+    print("比較: ⑥ 日次+20% 達成で当日トレード終了 — ON vs OFF")
+    print("=" * 65)
+
+    t_on, _ = run_backtest(
+        df1m, initial_balance, lot_size, use_daily_profit_stop=True, verbose=False
+    )
+    s_on = analyze(t_on, initial_balance)
+
+    t_off, _ = run_backtest(
+        df1m, initial_balance, lot_size, use_daily_profit_stop=False, verbose=False
+    )
+    s_off = analyze(t_off, initial_balance)
+
+    if not s_on or not s_off:
+        print("トレードなしのため比較できません。")
+        return None
+
+    def row(label, s):
+        return (
+            f"| {label} | {s['total_trades']} | {s['win_rate']:.1f}% | {s['profit_factor']:.2f} | "
+            f"¥{s['final_balance']:,.0f} | {s['total_return_pct']:+.1f}% | "
+            f"{s['max_dd_pct']:.1f}% | {s['max_consec_loss']} |"
+        )
+
+    lines = [
+        "",
+        "| ⑥ | 総トレード | 勝率 | PF | 最終残高 | 総収益率 | 最大DD | 最大連敗 |",
+        "|:--|----------:|-----:|---:|---------:|---------:|-------:|---------:|",
+        row("ON（+20%で当日停止）", s_on),
+        row("OFF（+20%停止なし）", s_off),
+        "",
+        f"*トレード数差: {s_off['total_trades'] - s_on['total_trades']:+d}（OFF より ON が少ない日は +20% で打ち切り）*",
+        "",
+    ]
+    text = "\n".join(lines)
+    print(text)
+
+    out_path = os.path.join(OUTPUT_DIR, "compare_daily_profit_stop_10k.md")
+    ensure_output_dir()
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("# ⑥ 日次+20% 停止 ON / OFF 比較（¥10,000・0.01ロット）\n\n")
+        f.write(text)
+    print(f"保存: {out_path}")
+    return {"on": s_on, "off": s_off, "trades_on": t_on, "trades_off": t_off}
 
 
 def _monthly_max_dd_by_exit(trades_df, initial_balance):
@@ -464,7 +552,7 @@ def write_summary_csv(rows, path):
 
 def write_summary_md(rows, path):
     lines = [
-        '# ロジック② A/B/C 比較サマリー（初期残高 10万円）',
+        '# ロジック② ロット別比較サマリー（初期残高 10万円）',
         '',
         '| シナリオ | ロット | 総トレード | 勝率 | PF | 最終残高 | 総収益率 | 最大DD | 最大連敗 | プラス月数 |',
         '|:---------|-------:|----------:|-----:|---:|---------:|---------:|-------:|---------:|-----------:|',
@@ -505,8 +593,16 @@ def write_monthly_md(scenario_name, monthly_df, path):
 
 
 if __name__ == '__main__':
+    import sys
+
     ensure_output_dir()
     df1m = load_data()
+
+    # 例: python backtest_logic2.py --compare-daily-profit
+    if '--compare-daily-profit' in sys.argv:
+        compare_daily_profit_stop(df1m)
+        sys.exit(0)
+
     results_l2 = {}
     summary_rows = []
 

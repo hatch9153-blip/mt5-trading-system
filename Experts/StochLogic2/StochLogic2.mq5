@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
 //|                                                  StochLogic2.mq5 |
 //| ロジック②: 4H/1H/5M Stochastics(9,3,3) — report_logic2.md 準拠   |
-//| チャート: M5 推奨（新バー確定時にシグナル判定）                    |
+//| シグナル足: M5（チャートの時間足は任意・テスターも M5 以外で可）   |
 //+------------------------------------------------------------------+
 #property copyright "MT5 Trading System"
 #property link      "https://github.com/hatch9153-blip/mt5-trading-system"
-#property version   "1.00"
+#property version   "1.01"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -60,6 +60,20 @@ int      g_consecLosses = 0;
 bool     g_dayBlocked = false;
 
 string   g_logFile = "StochLogic2_trades.csv";
+
+//+------------------------------------------------------------------+
+//| シンボルが許可する約定タイプを CTrade に設定（テスター/ブローカー差対策） |
+//+------------------------------------------------------------------+
+void ApplySymbolFillingMode()
+{
+   long fm = SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+   if((fm & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
+      g_trade.SetTypeFilling(ORDER_FILLING_IOC);
+   else if((fm & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
+      g_trade.SetTypeFilling(ORDER_FILLING_FOK);
+   else
+      g_trade.SetTypeFilling(ORDER_FILLING_RETURN);
+}
 
 //+------------------------------------------------------------------+
 bool CopyStochK1(const int handle, const int buffer, const int shift, double &v)
@@ -154,7 +168,7 @@ int OnInit()
 {
    g_trade.SetExpertMagicNumber(InpMagic);
    g_trade.SetDeviationInPoints(InpDeviationPoints);
-   g_trade.SetTypeFilling(ORDER_FILLING_IOC);
+   ApplySymbolFillingMode();
 
    g_h4 = iStochastic(_Symbol, PERIOD_H4, InpKPeriod, InpDPeriod, InpSlowing, MODE_SMA, STO_LOWHIGH);
    g_h1 = iStochastic(_Symbol, PERIOD_H1, InpKPeriod, InpDPeriod, InpSlowing, MODE_SMA, STO_LOWHIGH);
@@ -171,7 +185,8 @@ int OnInit()
    g_dayYmd = tm.year * 10000 + tm.mon * 100 + tm.day;
    g_dayStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
 
-   Print("StochLogic2: 初期化完了。M5チャート推奨。Magic=", InpMagic);
+   Print("StochLogic2 v1.01: 初期化完了。シグナルは M5 足で判定（チャート時間足は任意）。Magic=", InpMagic,
+         " filling=", (long)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE));
    return INIT_SUCCEEDED;
 }
 
@@ -186,15 +201,17 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   if(_Period != PERIOD_M5)
-      return;
-
+   // 注意: チャートが M1/H1 でも M5 の新バーで判定する（テスターは任意時間足で可）
    ResetDayIfNeeded();
 
    if(!IsNewM5Bar())
       return;
 
    if(Bars(_Symbol, PERIOD_M5) < 100)
+      return;
+
+   // インジケータ計算待ち（CopyBuffer が空になるのを防ぐ）
+   if(BarsCalculated(g_h5) < 50 || BarsCalculated(g_h4) < 20 || BarsCalculated(g_h1) < 50)
       return;
 
    const double loZone = InpOversold + InpZoneEps;
@@ -304,6 +321,8 @@ void OnTick()
       {
          if(g_trade.Buy(InpLot, _Symbol, 0, 0, 0, "L2 long"))
             Print("StochLogic2: Buy ", InpLot, " lot");
+         else
+            Print("StochLogic2: Buy failed retcode=", g_trade.ResultRetcode(), " ", g_trade.ResultComment());
       }
    }
    else if(g_strategy == STRAT_SHORT)
@@ -315,6 +334,8 @@ void OnTick()
       {
          if(g_trade.Sell(InpLot, _Symbol, 0, 0, 0, "L2 short"))
             Print("StochLogic2: Sell ", InpLot, " lot");
+         else
+            Print("StochLogic2: Sell failed retcode=", g_trade.ResultRetcode(), " ", g_trade.ResultComment());
       }
    }
 }
