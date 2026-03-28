@@ -44,8 +44,10 @@ SCENARIOS = [
 ]
 
 USD_JPY       = 150.0
-CONTRACT_SIZE = 10
-SPREAD_USD    = 0.30
+# 1ロットあたりの USD 損益スケール（ブローカー仕様に合わせ env で上書き可）
+CONTRACT_SIZE = float(os.environ.get("STOCH_CONTRACT_SIZE", "10"))
+# 往復相当のスプレッド（USD）。狭スプレッド口座は STOCH_SPREAD_USD で上書き。
+SPREAD_USD    = float(os.environ.get("STOCH_SPREAD_USD", "0.30"))
 
 K_PERIOD = 9
 D_PERIOD = 3
